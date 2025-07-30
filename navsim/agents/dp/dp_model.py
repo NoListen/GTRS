@@ -197,6 +197,123 @@ def cumsum_traj(norm_trajs):
     return torch.cat([x, y, heading], -1)
 
 
+def modulate(x, shift, scale):
+    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
+class TimestepEmbedder(nn.Module):
+    def __init__(self, hidden_size, frequency_embedding_size=256):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=True),
+        )
+        self.frequency_embedding_size = frequency_embedding_size
+
+    @staticmethod
+    def timestep_embedding(t, dim, max_period=10000):
+        half = dim // 2
+        freqs = torch.exp(
+            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device) / half
+        )
+        args = t[:, None].float() * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = F.pad(embedding, (0, 1))
+        return embedding
+
+    def forward(self, t):
+        if not torch.is_tensor(t):
+            t = torch.tensor([t], dtype=torch.long, device=self.mlp[0].weight.device)
+        if t.dim() == 0:
+            t = t[None]
+        emb = self.timestep_embedding(t, self.frequency_embedding_size)
+        emb = self.mlp(emb)
+        return emb
+
+
+class DiTBlock1D(nn.Module):
+    def __init__(self, hidden_size, num_heads, mlp_dim):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.attn = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
+        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_size, mlp_dim),
+            nn.GELU(),
+            nn.Linear(mlp_dim, hidden_size),
+        )
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+        )
+
+    def forward(self, x, c):
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
+        q = k = v = modulate(self.norm1(x), shift_msa, scale_msa)
+        attn_out, _ = self.attn(q, k, v)
+        x = x + gate_msa.unsqueeze(1) * attn_out
+        mlp_out = self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        x = x + gate_mlp.unsqueeze(1) * mlp_out
+        return x
+
+
+class FinalLayer1D(nn.Module):
+    def __init__(self, hidden_size, out_dim):
+        super().__init__()
+        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.linear = nn.Linear(hidden_size, out_dim, bias=True)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 2 * hidden_size, bias=True)
+        )
+
+    def forward(self, x, c):
+        shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
+        x = modulate(self.norm_final(x), shift, scale)
+        x = self.linear(x)
+        return x
+
+
+class DiTDiffusionTransformer(nn.Module):
+    def __init__(self, d_model, nhead, d_ffn, depth, input_dim, obs_len):
+        super().__init__()
+        self.input_emb = nn.Linear(input_dim, d_model)
+        self.time_emb = TimestepEmbedder(d_model)
+        self.cond_proj = nn.Linear(d_model, d_model)
+        self.pos_emb = nn.Parameter(torch.zeros(1, HORIZON, d_model))
+        self.blocks = nn.ModuleList([
+            DiTBlock1D(d_model, nhead, d_ffn) for _ in range(depth)
+        ])
+        self.final_layer = FinalLayer1D(d_model, input_dim)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+        elif isinstance(module, nn.LayerNorm):
+            nn.init.zeros_(module.bias)
+            nn.init.ones_(module.weight)
+
+    def forward(self, sample, timestep, cond):
+        B, L, D = sample.shape
+        x = self.input_emb(sample) + self.pos_emb[:, :L]
+        if not torch.is_tensor(timestep):
+            timestep = torch.tensor([timestep], dtype=torch.long, device=x.device)
+        if timestep.dim() == 0:
+            timestep = timestep[None].to(x.device)
+        timestep = timestep.expand(B)
+        t_emb = self.time_emb(timestep)
+        c = t_emb + self.cond_proj(cond.mean(dim=1))
+        for blk in self.blocks:
+            x = blk(x, c)
+        x = self.final_layer(x, c)
+        return x
+
+
 class DPHead(nn.Module):
     def __init__(self, num_poses: int, d_ffn: int, d_model: int, vocab_path: str,
                  nhead: int, nlayers: int, config: DPConfig = None
@@ -215,9 +332,9 @@ class DPHead(nn.Module):
         )
         img_num = 2 if config.use_back_view else 1
 
-        self.transformer_dp = SimpleDiffusionTransformer(
+        self.transformer_dp = DiTDiffusionTransformer(
             d_model, nhead, d_ffn, config.dp_layers,
-            input_dim=ACTION_DIM * HORIZON,
+            input_dim=ACTION_DIM,
             obs_len=config.img_vert_anchors * config.img_horz_anchors * img_num + 1,
         )
         self.num_inference_steps = self.noise_scheduler.config.num_train_timesteps

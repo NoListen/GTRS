@@ -258,6 +258,29 @@ class DiTBlock1D(nn.Module):
         x = x + gate_mlp.unsqueeze(1) * mlp_out
         return x
 
+class DiTBlockWithCrossAttention1D(nn.Module):
+    def __init__(self, hidden_size, num_heads, mlp_dim):
+        super().__init__()
+        self.dit_block = DiTBlock1D(hidden_size, num_heads, mlp_dim)
+        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.cross_attn = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
+        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_size, mlp_dim),
+            nn.GELU(),
+            nn.Linear(mlp_dim, hidden_size),
+        )
+
+    def forward(self, x, c, context):
+        x = self.dit_block(x, c)
+        # layer norm1
+        q = self.norm1(x)
+        k = v = context
+        attn_out, _ = self.attn(q, k, v)
+        x = x + attn_out
+        mlp_out = self.mlp(self.norm2(x))
+        x = x + mlp_out
+        return x
 
 class FinalLayer1D(nn.Module):
     def __init__(self, hidden_size, out_dim):
@@ -282,11 +305,13 @@ class DiTDiffusionTransformer(nn.Module):
         self.input_emb = nn.Linear(input_dim, d_model)
         self.time_emb = TimestepEmbedder(d_model)
         self.cond_proj = nn.Linear(d_model, d_model)
-        self.pos_emb = nn.Parameter(torch.zeros(1, HORIZON, d_model))
+        self.pos_emb = nn.Parameter(torch.zeros(1, HORIZON, d_model))  # HORIZON needs to be defined
+
         self.blocks = nn.ModuleList([
-            DiTBlock1D(d_model, nhead, d_ffn) for _ in range(depth)
+            DiTBlockWithCrossAttention1D(d_model, nhead, d_ffn) for _ in range(depth)
         ])
-        self.final_layer = FinalLayer1D(d_model, input_dim)
+        self.final_layer = FinalLayer1D(d_model, input_dim)  # Assumed already defined
+
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
@@ -298,21 +323,34 @@ class DiTDiffusionTransformer(nn.Module):
             nn.init.zeros_(module.bias)
             nn.init.ones_(module.weight)
 
-    def forward(self, sample, timestep, cond):
+    def forward(self, sample, timestep, cond, context):
+        """
+        sample: (B, L, input_dim) - Noised input
+        timestep: (B,) or scalar - Diffusion timestep
+        cond: (B, T_cond, d_model) - VLM tokens or similar condition
+        context: (B, T_ctx, d_model) - Cross-attention tokens (same as cond if no separate context)
+        """
         B, L, D = sample.shape
-        x = self.input_emb(sample) + self.pos_emb[:, :L]
+        x = self.input_emb(sample) + self.pos_emb[:, :L]  # Add positional encoding
+
+        # Process timestep and cond
         if not torch.is_tensor(timestep):
             timestep = torch.tensor([timestep], dtype=torch.long, device=x.device)
         if timestep.dim() == 0:
-            timestep = timestep[None].to(x.device)
+            timestep = timestep[None]
         timestep = timestep.expand(B)
-        t_emb = self.time_emb(timestep)
-        c = t_emb + self.cond_proj(cond.mean(dim=1))
+        t_emb = self.time_emb(timestep)  # (B, d_model)
+
+        # Combine time + average VLM condition
+        pooled_cond = cond.mean(dim=1)  # (B, d_model)
+        c = t_emb + self.cond_proj(pooled_cond)
+
+        # Apply transformer blocks
         for blk in self.blocks:
-            x = blk(x, c)
+            x = blk(x, c, context)
+
         x = self.final_layer(x, c)
         return x
-
 
 class DPHead(nn.Module):
     def __init__(self, num_poses: int, d_ffn: int, d_model: int, vocab_path: str,
@@ -332,27 +370,25 @@ class DPHead(nn.Module):
         )
         img_num = 2 if config.use_back_view else 1
 
-        self.transformer_dp = SimpleDiffusionTransformer(
         self.transformer_dp = DiTDiffusionTransformer(
             d_model, nhead, d_ffn, config.dp_layers,
             input_dim=ACTION_DIM * HORIZON,
-            input_dim=ACTION_DIM,
             obs_len=config.img_vert_anchors * config.img_horz_anchors * img_num + 1,
         )
         self.num_inference_steps = self.noise_scheduler.config.num_train_timesteps
 
-    def forward(self, kv) -> Dict[str, torch.Tensor]:
-        B = kv.shape[0]
+    def forward(self, cond, context) -> Dict[str, torch.Tensor]:
+        B = context.shape[0]
         result = {}
         if not self.training:
             NUM_PROPOSALS = self.config.num_proposals
-
-            condition = kv.repeat_interleave(NUM_PROPOSALS, dim=0)
-
+            # the original condition is modified into context.
+            context = context.repeat_interleave(NUM_PROPOSALS, dim=0)
+            cond = cond.repeat_interleave(NUM_PROPOSALS, dim=0)
             noise = torch.randn(
                 size=(B * NUM_PROPOSALS, HORIZON, ACTION_DIM),
-                dtype=condition.dtype,
-                device=condition.device,
+                dtype=context.dtype,
+                device=context.device,
             )
 
             self.noise_scheduler.set_timesteps(self.num_inference_steps)
@@ -361,7 +397,8 @@ class DPHead(nn.Module):
                 model_output = self.transformer_dp(
                     noise,
                     t,
-                    condition
+                    cond=cond,
+                    context=context
                 )
                 noise = self.noise_scheduler.step(
                     model_output, t, noise
@@ -371,9 +408,9 @@ class DPHead(nn.Module):
 
         return result
 
-    def get_dp_loss(self, kv, gt_trajectory):
-        B = kv.shape[0]
-        device = kv.device
+    def get_dp_loss(self, cond, context, gt_trajectory):
+        B = context.shape[0]
+        device = context.device
         gt_trajectory = gt_trajectory.float()
         gt_trajectory = diff_traj(gt_trajectory)
 
@@ -393,7 +430,8 @@ class DPHead(nn.Module):
         pred = self.transformer_dp(
             noisy_dp_input,
             timesteps,
-            kv
+            cond=cond,
+            context=context
         )
         return F.mse_loss(pred, noise)
 
@@ -511,7 +549,7 @@ class DPModel(nn.Module):
         keyval += self._keyval_embedding.weight[None, ...]
 
         output: Dict[str, torch.Tensor] = {}
-        trajectory = self._trajectory_head(keyval)
+        trajectory = self._trajectory_head(cond=status_feature, cotext=keyval)
 
         output.update(trajectory)
 

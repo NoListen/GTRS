@@ -379,61 +379,124 @@ class DPHead(nn.Module):
 
     def forward(self, cond, context) -> Dict[str, torch.Tensor]:
         B = context.shape[0]
-        result = {}
-        if not self.training:
-            NUM_PROPOSALS = self.config.num_proposals
-            # the original condition is modified into context.
-            context = context.repeat_interleave(NUM_PROPOSALS, dim=0)
-            cond = cond.repeat_interleave(NUM_PROPOSALS, dim=0)
-            noise = torch.randn(
-                size=(B * NUM_PROPOSALS, HORIZON, ACTION_DIM),
-                dtype=context.dtype,
-                device=context.device,
-            )
-
-            self.noise_scheduler.set_timesteps(self.num_inference_steps)
-
-            for t in self.noise_scheduler.timesteps:
-                model_output = self.transformer_dp(
-                    noise,
-                    t,
-                    cond=cond,
-                    context=context
-                )
-                noise = self.noise_scheduler.step(
-                    model_output, t, noise
-                ).prev_sample
-            traj = cumsum_traj(noise)
-            result['dp_pred'] = traj.view(B, NUM_PROPOSALS, HORIZON, ACTION_DIM_ORI)
-
-        return result
-
-    def get_dp_loss(self, cond, context, gt_trajectory):
-        B = context.shape[0]
+        NUM = self.config.num_proposals
+        T = self.noise_scheduler.num_inference_steps
         device = context.device
-        gt_trajectory = gt_trajectory.float()
-        gt_trajectory = diff_traj(gt_trajectory)
 
-        noise = torch.randn(gt_trajectory.shape, device=device, dtype=torch.float)
-        # Sample a random timestep for each image
-        timesteps = torch.randint(
-            0, self.noise_scheduler.config.num_train_timesteps,
-            (B,), device=device
-        ).long()
-        # Add noise to the clean images according to the noise magnitude at each timestep
-        # (this is the forward diffusion process)
-        noisy_dp_input = self.noise_scheduler.add_noise(
-            gt_trajectory, noise, timesteps
-        )
+        context = context.repeat_interleave(NUM, dim=0)
+        cond = cond.repeat_interleave(NUM, dim=0)
+        noise = torch.randn((B*NUM, HORIZON, ACTION_DIM), device=device, dtype=cond.dtype)
+        self.noise_scheduler.set_timesteps(self.num_inference_steps)
 
-        # Predict the noise residual
-        pred = self.transformer_dp(
-            noisy_dp_input,
-            timesteps,
-            cond=cond,
-            context=context
-        )
-        return F.mse_loss(pred, noise)
+        log_step = torch.zeros((B*NUM, T), device=device)
+        bc_log_step = torch.zeros((B*NUM, T), device=device)
+
+        for idx, t in enumerate(self.noise_scheduler.timesteps):
+            out = self.transformer_dp(noise, t, cond=cond, context=context)
+            prev = self.noise_scheduler.step(out, t, noise).prev_sample
+            log_step[:, idx] = self.compute_log_prob_step(out, t, noise, prev)
+
+            with torch.no_grad():
+                ref_out = self.ref_model.transformer_dp(noise, t, cond=cond, context=context)
+            bc_log_step[:, idx] = self.compute_log_prob_step(ref_out, t, noise, prev)
+
+            noise = prev
+
+        traj = cumsum_traj(noise)
+        return {
+            'trajectories': traj.view(B, NUM, HORIZON, ACTION_DIM_ORI),
+            'log_step_probs': log_step.view(B, NUM, T),
+            'bc_log_step_probs': bc_log_step.view(B, NUM, T)
+        }
+    
+    def get_dp_loss(
+        self,
+        log_step_probs: torch.Tensor,      # 主模型 per-step log π: (B, G, T)
+        pdm_scores: torch.Tensor,          # PDMS reward: (B, G)
+        bc_log_step_probs: torch.Tensor     # π_ref per-step log π: (B, G, T)
+    ):
+        B, G, T = log_step_probs.shape
+        device = log_step_probs.device
+
+        # 1. Group-standardized advantage Â_i
+        rewards = pdm_scores.to(device)
+        mean_r = rewards.mean(dim=1, keepdim=True)
+        std_r = rewards.std(dim=1, keepdim=True)
+        adv = (rewards - mean_r) / (std_r + self.config.std_eps)  # B×G
+
+        # 2. 为每步加 γ^(t−1)，计算 chain 平均 log-likelihood
+        gamma = torch.tensor([self.config.gamma ** t for t in range(T)], device=device)
+        discounted_ll = (log_step_probs * gamma.view(1,1,T)).mean(dim=2)  # B×G
+
+        # 3. RL 目标项
+        rl_loss = -(discounted_ll * adv).mean()
+
+        # 4. Reference 模型的 BC 项
+        bc_ll = (bc_log_step_probs * gamma.view(1,1,T)).mean(dim=2)  # B×G
+        bc_loss = -self.config.bc_weight * bc_ll.mean()
+
+        total_loss = self.config.rl_weight * rl_loss + bc_loss
+        metrics = {
+            'rl_loss': rl_loss.item(),
+            'bc_loss': bc_ll.mean().item(),
+            'mean_adv': adv.mean().item(),
+            'std_adv': rewards.std(dim=1).mean().item()
+        }
+        return total_loss, metrics
+    
+    def compute_log_prob_step(self, model_output, t_idx, x_t, x_prev):
+        """
+        计算 pθ(x_{t-1} | x_t) 的 log 概率：
+        log π = -½ * ||x_prev - μθ||² / σ_t²  + const
+        使用 DDPM 中的 beta_t, alpha_t 和累积 alpha 来推导 μθ 和 σ_t.
+        """
+        # 从 scheduler 获取 beta_t 和 alpha cumulative prod
+        beta_t = self.noise_scheduler.betas[t_idx]                      # βₜ
+        alpha_t = 1.0 - beta_t                                            # αₜ
+        alpha_cum = self.noise_scheduler.alphas_cumprod[t_idx]          # \bar{α}_t
+        
+        sqrt_alpha_cum = torch.sqrt(alpha_cum)
+        sqrt_one_minus = torch.sqrt(1.0 - alpha_cum)
+        
+        # 假设 model_output 是 εθ(x_t, t)
+        mu_theta = (x_t - sqrt_one_minus * model_output) / sqrt_alpha_cum
+
+        # 反向扩散的 σ_t
+        # 对于 DDPM：σ_t² = β_t（常规简化假设）
+        sigma_t = torch.sqrt(beta_t)
+
+        delta = x_prev - mu_theta  # B×H×D
+        # Gaussian log-prob 梯度方向常数项忽略
+        log_prob = -0.5 * torch.sum(delta ** 2, dim=[1,2]) / (sigma_t ** 2 + 1e-8)
+
+        return log_prob  # shape (B,)
+
+    # def get_dp_loss(self, cond, context, gt_trajectory):
+    #     B = context.shape[0]
+    #     device = context.device
+    #     gt_trajectory = gt_trajectory.float()
+    #     gt_trajectory = diff_traj(gt_trajectory)
+
+    #     noise = torch.randn(gt_trajectory.shape, device=device, dtype=torch.float)
+    #     # Sample a random timestep for each image
+    #     timesteps = torch.randint(
+    #         0, self.noise_scheduler.config.num_train_timesteps,
+    #         (B,), device=device
+    #     ).long()
+    #     # Add noise to the clean images according to the noise magnitude at each timestep
+    #     # (this is the forward diffusion process)
+    #     noisy_dp_input = self.noise_scheduler.add_noise(
+    #         gt_trajectory, noise, timesteps
+    #     )
+
+    #     # Predict the noise residual
+    #     pred = self.transformer_dp(
+    #         noisy_dp_input,
+    #         timesteps,
+    #         cond=cond,
+    #         context=context
+    #     )
+    #     return F.mse_loss(pred, noise)
 
 
 class DPModel(nn.Module):
